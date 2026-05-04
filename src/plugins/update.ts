@@ -729,12 +729,30 @@ function createPluginUpdateIntegrityDriftHandler(params: {
   };
 }
 
+function disablePluginConfigEntry(config: OpenClawConfig, pluginId: string): OpenClawConfig {
+  const existingEntry = config.plugins?.entries?.[pluginId];
+  return {
+    ...config,
+    plugins: {
+      ...config.plugins,
+      entries: {
+        ...config.plugins?.entries,
+        [pluginId]: {
+          ...existingEntry,
+          enabled: false,
+        },
+      },
+    },
+  };
+}
+
 export async function updateNpmInstalledPlugins(params: {
   config: OpenClawConfig;
   logger?: PluginUpdateLogger;
   pluginIds?: string[];
   skipIds?: Set<string>;
   skipDisabledPlugins?: boolean;
+  disableOnFailure?: boolean;
   timeoutMs?: number;
   dryRun?: boolean;
   updateChannel?: UpdateChannel;
@@ -752,6 +770,28 @@ export async function updateNpmInstalledPlugins(params: {
   const outcomes: PluginUpdateOutcome[] = [];
   let next = params.config;
   let changed = false;
+
+  const recordFailure = (pluginId: string, message: string) => {
+    if (params.disableOnFailure && !params.dryRun) {
+      const disabledMessage =
+        `Disabled "${pluginId}" after plugin update failure; OpenClaw will continue without it. ` +
+        message;
+      logger.warn?.(disabledMessage);
+      next = disablePluginConfigEntry(next, pluginId);
+      changed = true;
+      outcomes.push({
+        pluginId,
+        status: "skipped",
+        message: disabledMessage,
+      });
+      return;
+    }
+    outcomes.push({
+      pluginId,
+      status: "error",
+      message,
+    });
+  };
 
   for (const pluginId of targets) {
     if (params.skipIds?.has(pluginId)) {
@@ -910,11 +950,7 @@ export async function updateNpmInstalledPlugins(params: {
         record.installPath?.trim() || resolvePluginInstallDir(pluginId),
       );
     } catch (err) {
-      outcomes.push({
-        pluginId,
-        status: "error",
-        message: `Invalid install path for "${pluginId}": ${String(err)}`,
-      });
+      recordFailure(pluginId, `Invalid install path for "${pluginId}": ${String(err)}`);
       continue;
     }
     const currentVersion = await readInstalledPackageVersion(installPath);
@@ -1019,11 +1055,7 @@ export async function updateNpmInstalledPlugins(params: {
                     logger,
                   });
       } catch (err) {
-        outcomes.push({
-          pluginId,
-          status: "error",
-          message: `Failed to check ${pluginId}: ${String(err)}`,
-        });
+        recordFailure(pluginId, `Failed to check ${pluginId}: ${String(err)}`);
         continue;
       }
       if (
@@ -1076,39 +1108,37 @@ export async function updateNpmInstalledPlugins(params: {
         });
       }
       if (!probe.ok) {
-        outcomes.push({
+        recordFailure(
           pluginId,
-          status: "error",
-          message:
-            record.source === "npm"
-              ? formatNpmInstallFailure({
+          record.source === "npm"
+            ? formatNpmInstallFailure({
+                pluginId,
+                spec: effectiveSpec!,
+                phase: "check",
+                result: probe,
+              })
+            : record.source === "clawhub"
+              ? formatClawHubInstallFailure({
                   pluginId,
-                  spec: effectiveSpec!,
+                  spec: effectiveSpec ?? `clawhub:${record.clawhubPackage!}`,
                   phase: "check",
-                  result: probe,
+                  error: probe.error,
                 })
-              : record.source === "clawhub"
-                ? formatClawHubInstallFailure({
+              : record.source === "git"
+                ? formatGitInstallFailure({
                     pluginId,
-                    spec: effectiveSpec ?? `clawhub:${record.clawhubPackage!}`,
+                    spec: effectiveSpec!,
                     phase: "check",
                     error: probe.error,
                   })
-                : record.source === "git"
-                  ? formatGitInstallFailure({
-                      pluginId,
-                      spec: effectiveSpec!,
-                      phase: "check",
-                      error: probe.error,
-                    })
-                  : formatMarketplaceInstallFailure({
-                      pluginId,
-                      marketplaceSource: record.marketplaceSource!,
-                      marketplacePlugin: record.marketplacePlugin!,
-                      phase: "check",
-                      error: probe.error,
-                    }),
-        });
+                : formatMarketplaceInstallFailure({
+                    pluginId,
+                    marketplaceSource: record.marketplaceSource!,
+                    marketplacePlugin: record.marketplacePlugin!,
+                    phase: "check",
+                    error: probe.error,
+                  }),
+        );
         continue;
       }
 
@@ -1200,11 +1230,7 @@ export async function updateNpmInstalledPlugins(params: {
                   logger,
                 });
     } catch (err) {
-      outcomes.push({
-        pluginId,
-        status: "error",
-        message: `Failed to update ${pluginId}: ${String(err)}`,
-      });
+      recordFailure(pluginId, `Failed to update ${pluginId}: ${String(err)}`);
       continue;
     }
     if (
@@ -1255,39 +1281,37 @@ export async function updateNpmInstalledPlugins(params: {
       });
     }
     if (!result.ok) {
-      outcomes.push({
+      recordFailure(
         pluginId,
-        status: "error",
-        message:
-          record.source === "npm"
-            ? formatNpmInstallFailure({
+        record.source === "npm"
+          ? formatNpmInstallFailure({
+              pluginId,
+              spec: effectiveSpec!,
+              phase: "update",
+              result: result,
+            })
+          : record.source === "clawhub"
+            ? formatClawHubInstallFailure({
                 pluginId,
-                spec: effectiveSpec!,
+                spec: effectiveSpec ?? `clawhub:${record.clawhubPackage!}`,
                 phase: "update",
-                result: result,
+                error: result.error,
               })
-            : record.source === "clawhub"
-              ? formatClawHubInstallFailure({
+            : record.source === "git"
+              ? formatGitInstallFailure({
                   pluginId,
-                  spec: effectiveSpec ?? `clawhub:${record.clawhubPackage!}`,
+                  spec: effectiveSpec!,
                   phase: "update",
                   error: result.error,
                 })
-              : record.source === "git"
-                ? formatGitInstallFailure({
-                    pluginId,
-                    spec: effectiveSpec!,
-                    phase: "update",
-                    error: result.error,
-                  })
-                : formatMarketplaceInstallFailure({
-                    pluginId,
-                    marketplaceSource: record.marketplaceSource!,
-                    marketplacePlugin: record.marketplacePlugin!,
-                    phase: "update",
-                    error: result.error,
-                  }),
-      });
+              : formatMarketplaceInstallFailure({
+                  pluginId,
+                  marketplaceSource: record.marketplaceSource!,
+                  marketplacePlugin: record.marketplacePlugin!,
+                  phase: "update",
+                  error: result.error,
+                }),
+      );
       continue;
     }
 
